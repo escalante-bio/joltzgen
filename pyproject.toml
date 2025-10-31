@@ -1,0 +1,33 @@
+[project]
+name = "joltzgen"
+version = "0.1.0"
+description = "JAX translation of BoltzGen"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "boltzgen>=0.1.2",
+    "einops>=0.8.0",
+    "equinox>=0.11.10",
+    "gemmi>=0.6.5",
+    "jaxtyping>=0.2.36",
+    "numpy>=1.26.3",
+]
+
+[dependency-groups]
+jax-cpu = [
+  "jax[cpu]",
+]
+jax-cuda = [
+  "jax[cuda]",
+]
+
+[tool.uv]
+package = true
+conflicts = [
+    [
+      { group = "jax-cpu" },
+      { group = "jax-cuda" },
+    ],
+]
+override-dependencies = ["scipy==1.15.1", "numpy==2.1", "tokenizers==v0.21.4"]
+
