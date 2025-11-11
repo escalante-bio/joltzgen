@@ -1,6 +1,6 @@
 """
 
-Simple translation of Boltz-1 to JAX.
+Simple translation of BoltGen to JAX.
 
 We use single-dispatch to convert PyTorch modules to Equinox modules recursively.
 
@@ -12,24 +12,27 @@ Because the implementation of this function is almost always the same I use `Abs
 The final step is to register that function with the `from_torch` dispatcher. This is done with the `register_from_torch` class decorator, which takes a PyTorch module type and returns a decorator that registers the `from_torch` method of the equinox module.
 
 `backend.py` contains the basic machinery for this and some translations of vanilla PyTorch modules.
-This file contains translations of Boltz-1 modules.
+This file contains translations of BoltzGen modules.
 
 
 """
 
-from functools import partial
 from typing import Literal
 
 import boltzgen
+import boltzgen.model
+import boltzgen.model.layers
 import boltzgen.model.layers.outer_product_mean
 import boltzgen.model.layers.pair_averaging
 import boltzgen.model.layers.pairformer
 import boltzgen.model.layers.transition
 import boltzgen.model.layers.triangular
+import boltzgen.model.layers.triangular_attention
 import boltzgen.model.layers.triangular_attention.attention
 import boltzgen.model.layers.triangular_attention.primitives
 import boltzgen.model.models
 import boltzgen.model.models.boltz
+import boltzgen.model.modules
 import boltzgen.model.modules.confidence
 import boltzgen.model.modules.diffusion
 import boltzgen.model.modules.diffusion_conditioning
@@ -75,7 +78,6 @@ def get_dropout_mask(
 ) -> Float[Array, "..."]:
     dropout = dropout * training
     v = z[:, 0:1, :, 0:1] if columnwise else z[:, :, 0:1, 0:1]
-    # d = torch.rand_like(v) > dropout
     d = jax.random.bernoulli(key, 1 - dropout, v.shape) > 0
     d = d * 1.0 / (1.0 - dropout)
     return d, jax.random.fold_in(key, 0)
@@ -345,14 +347,45 @@ class ConditionedTransitionBlock(AbstractFromTorch):
         return self.output_projection(s) * self.b_to_a(b)
 
 
-def single_to_keys(single, indexing_matrix, W, H):
-    B, N, D = single.shape
-    K = N // W
-    single = single.reshape(B, 2 * K, W // 2, D)
-    r = jnp.einsum("b j i d, j k -> b k i d", single, indexing_matrix).reshape(
-        B, K, H, D
-    )
-    return r
+
+class SingleToKeys(eqx.Module):
+    indexing_matrix: Float[Array, "J K"]
+    W: int
+    H: int
+
+    def __call__(self, single: Float[Array, "B N D"]) -> Float[Array, "B K H D"]:
+        B, N, D = single.shape
+        K = N // self.W
+        single = single.reshape(B, 2 * K, self.W // 2, D)
+        r = jnp.einsum(
+            "b j i d, j k -> b k i d", single, self.indexing_matrix
+        ).reshape(B, K, self.H, D)
+        return r
+
+
+#to_keys_new = lambda x: to_keys(x.reshape(B, NW * W, -1)).reshape(B * NW, H, -1)
+
+
+class ReshapedSTK(eqx.Module):
+    to_keys: SingleToKeys
+    B: int
+    NW: int
+    W: int
+    H: int
+
+    def __call__(self, x):
+        return self.to_keys(x.reshape(self.B, self.NW * self.W, -1)).reshape(self.B * self.NW, self.H, -1)
+       
+
+
+# def single_to_keys(single, indexing_matrix, W, H):
+#     B, N, D = single.shape
+#     K = N // W
+#     single = single.reshape(B, 2 * K, W // 2, D)
+#     r = jnp.einsum("b j i d, j k -> b k i d", single, indexing_matrix).reshape(
+#         B, K, H, D
+#     )
+#     return r
 
 
 @register_from_torch(boltzgen.model.modules.encoders.FourierEmbedding)
@@ -866,8 +899,11 @@ class AtomEncoder(AbstractFromTorch):
         B, N = c.shape[:2]
         K = N // W
         keys_indexing_matrix = get_indexing_matrix2(K, W, H)
-        to_keys = partial(
-            single_to_keys, indexing_matrix=keys_indexing_matrix, W=W, H=H
+        # to_keys = partial(
+        #     single_to_keys, indexing_matrix=keys_indexing_matrix, W=W, H=H
+        # )
+        to_keys = SingleToKeys(
+            indexing_matrix=jnp.array(keys_indexing_matrix), W=W, H=H
         )
 
         atom_ref_pos_queries = atom_ref_pos.reshape(B, K, W, 1, 3)
@@ -1021,7 +1057,10 @@ class AtomTransformer(AbstractFromTorch):
             mask = mask.reshape(B * NW, W)
         bias = bias.reshape((bias.shape[0] * NW, W, H, -1))
 
-        to_keys_new = lambda x: to_keys(x.reshape(B, NW * W, -1)).reshape(B * NW, H, -1)
+        # to_keys_new = lambda x: to_keys(x.reshape(B, NW * W, -1)).reshape(B * NW, H, -1)
+        to_keys_new = ReshapedSTK(
+            to_keys=to_keys, B=B, NW=NW, W=W, H=H
+        )
 
         q = self.diffusion_transformer(
             a=q,
@@ -1400,7 +1439,6 @@ class MSAModule(eqx.Module):
         """
 
         msa = feats["msa"]
-        # msa = jax.nn.one_hot(msa, num_classes=const.num_tokens)
         has_deletion = feats["has_deletion"][..., None]
         deletion_value = feats["deletion_value"][..., None]
         is_paired = feats["msa_paired"][..., None]
@@ -1412,13 +1450,6 @@ class MSAModule(eqx.Module):
             m = jnp.concatenate([msa, has_deletion, deletion_value, is_paired], axis=-1)
         else:
             m = jnp.concatenate([msa, has_deletion, deletion_value], axis=-1)
-
-        # if self.subsample_msa:
-        #     msa_indices = jax.random.permutation(key, jnp.arange(msa.shape[1]))[
-        #         : self.num_subsampled_msa
-        #     ]
-        #     m = m[:, msa_indices]
-        #     msa_mask = msa_mask[:, msa_indices]
 
         # Compute input projections
         m = self.msa_proj(m)
@@ -1446,7 +1477,6 @@ class MSAModule(eqx.Module):
         ]  # only return z
 
 
-# register_from_torch(boltz.model.modules.trunkv2.FourierEmbedding)(FourierEmbedding)
 
 
 @register_from_torch(boltzgen.model.modules.trunk.ContactConditioning)
